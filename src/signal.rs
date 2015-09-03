@@ -5,12 +5,20 @@
 //use std::boxed::into_raw;
 use std::mem::transmute;
 
+use traits::FFIWidget;
 use glib::signal::connect;
 use glib::translate::*;
 use glib::{FFIGObject, ParamSpec};
 
 use glib_ffi::gboolean;
-use ffi::{GtkAdjustment, GtkTreeSelection, GtkTreeViewColumn};
+use ffi::{
+    GtkAdjustment,
+    GtkTreeSelection,
+    GtkTreeViewColumn,
+    GtkTreeIter,
+    GtkTreePath,
+};
+use libc;
 use gdk::{
     EventAny,
     EventButton,
@@ -69,6 +77,75 @@ impl ToGlib for Inhibit {
 
 // libstd stability workaround
 unsafe fn into_raw<T>(b: Box<T>) -> *mut T { transmute(b) }
+
+
+macro_rules! signal_trait(
+    ($trait_name:ident, $this_ty:ty, $($func_name:ident(_$(,$arg_ty:ty)*) $(-> $out_ty:ty),*),+) => (
+        pub trait $trait_name {
+            $(
+                fn $func_name<F: Fn($this_ty, $($arg_ty),*) $(-> $out_ty)*>(&self, f: F) -> u64;
+            )+
+        }
+    )
+);
+
+macro_rules! signal_impl (
+    ($this_translates:ident, $the_trait:ty, $this_ty: ty, $this_ffi_ty: ty, $($name: expr, $func_name: ident
+    (_$(,$arg_name: ident:($arg_ffi_ty: ty > $translate: ident > $arg_ty: ty))*) -> ($out_ty:ty > $out_translate:ident > $out_ffi_ty:ty)),+) => (
+        impl $the_trait for $this_ty {
+            $(
+            signal_method!(
+                $this_translates,
+                $name,
+                $func_name (this: (*mut $this_ffi_ty > $this_translates > $this_ty)
+                    $(, $arg_name: ($arg_ffi_ty > $translate > $arg_ty))*
+                    ) -> ($out_ty > $out_translate > $out_ffi_ty));
+            )+
+        }
+    )
+);
+
+macro_rules! signal_method (
+    ($this_translates:ident, $name: expr, $func_name: ident ($($arg:ident: ($arg_ffi_ty:ty > $translate:ident > $arg_ty:ty)),*) -> ($out_ty:ty > $out_translate:ident > $out_ffi_ty:ty)) => (
+        fn $func_name<F: Fn($($arg_ty),*) -> $out_ty + 'static>(&self, f: F) -> u64 {
+            extern "C" fn trampoline($($arg: $arg_ffi_ty,)* f: &Box<Fn($($arg_ty),*) -> $out_ty + 'static>) -> $out_ffi_ty {
+                $out_translate!(
+                    $out_ty,
+                    f($($translate!($arg_ty, $arg),)*)
+                )
+            }
+            use std::mem::transmute;
+            use glib::signal::connect;
+
+            unsafe {
+                let f: Box<Box<Fn($($arg_ty),*) -> $out_ty + 'static>> = Box::new(Box::new(f));
+                // FIXME
+                let this = self;
+                connect($this_translates!(this) as *mut _, $name,
+                    transmute(trampoline), into_raw(f) as *mut _)
+            }
+        }
+    )
+);
+
+macro_rules! widget{
+    ($ty:ty, $e:expr) => (FFIWidget::wrap_widget($e as *mut _));
+    ($e:expr) => (($e.unwrap_widget()));
+}
+
+macro_rules! gobject{
+    ($ty:ty, $e:expr) => (<$ty>::wrap_pointer($e));
+    ($e:expr) => ($e.unwrap_pointer());
+}
+
+macro_rules! void { ($ty:ty, $e:expr) => ($e;) }
+macro_rules! echo { ($ty:ty, $e:expr) => ($e) }
+macro_rules! to_glib { ($ty:ty, $e:expr) => ($e.to_glib()) }
+macro_rules! from_glib { ($ty:ty, $e:expr) => (from_glib($e)) }
+
+// can't do <&mut TreeIter>::wrap_pointer...
+macro_rules! translate_treeiter { ($ty:ty, $e:expr) => ( &mut TreeIter::wrap_pointer($e)) }
+
 
 pub trait WidgetSignals {
     fn connect_notify<F: Fn(Widget, &ParamSpec) + 'static>(&self, f: F) -> u64;
@@ -993,324 +1070,77 @@ mod spin_button {
     }
 }
 
-pub trait DialogSignals {
-    fn connect_close<F: Fn(Dialog) + 'static>(&self, f: F) -> u64;
-    fn connect_response<F: Fn(Dialog, i32) + 'static>(&self, f: F) -> u64;
-}
+signal_trait!(DialogSignals, Dialog,
+    connect_close(_),
+    connect_response(_, i32)
+);
+signal_impl!(widget, DialogSignals, Dialog, ::ffi::GtkDialog,
+    "close", connect_close(_) -> (() > void > ()),
+    "response", connect_response(_, response: (libc::c_int > echo > i32)) -> (() > void > ())
+);
 
-mod dialog {
-    use super::into_raw;
-    use std::mem::transmute;
-    use libc::c_int;
-    use glib::signal::connect;
-    use traits::{FFIWidget, DialogTrait};
-    use ffi::GtkDialog;
-    use Dialog;
 
-    impl<T: FFIWidget + DialogTrait> super::DialogSignals for T {
-        fn connect_close<F: Fn(Dialog) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(Dialog) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "close",
-                    transmute(void_trampoline), into_raw(f) as *mut _)
-            }
-        }
+signal_trait!(TreeViewSignals, TreeView,
+    connect_columns_changed(_),
+    connect_cursor_changed(_),
+    connect_expand_collapse_cursor_row(_, bool, bool, bool) -> bool,
+    connect_row_activated(_, TreePath, TreeViewColumn),
+    connect_row_collapsed(_, &mut TreeIter, TreePath),
+    connect_row_expanded(_, &mut TreeIter, TreePath),
+    connect_select_all(_) -> bool,
+    connect_select_cursor_parent(_) -> bool,
+    connect_select_cursor_row(_, bool) -> bool,
+    connect_start_interactive_search(_) -> bool,
+    connect_test_collapse_row(_, &mut TreeIter, TreePath) -> bool,
+    connect_test_expand_row(_, &mut TreeIter, TreePath) -> bool,
+    connect_toggle_cursor_row(_) -> bool,
+    connect_unselect_all(_) -> bool
+);
+signal_impl!(widget, TreeViewSignals, TreeView, ::ffi::GtkTreeView,
+    "columns-changed", connect_columns_changed(_) -> (() > void > ()),
+    "cursor-changed", connect_cursor_changed(_) -> (() > void > ()),
+    "expand-collapse-cursor-row", connect_expand_collapse_cursor_row
+        (_, arg1: (gboolean > from_glib > bool),
+            arg2: (gboolean > from_glib > bool),
+            arg3: (gboolean > from_glib > bool)) -> (bool > to_glib > gboolean),
+    "row-activated", connect_row_activated
+        (_, path: (*mut GtkTreePath > gobject > TreePath),
+            column: (*mut GtkTreeViewColumn > gobject > TreeViewColumn)) -> (() > void > ()),
+    "row-collapsed", connect_row_collapsed
+        (_, iter: (*mut GtkTreeIter > translate_treeiter > &mut TreeIter),
+            path: (*mut GtkTreePath > gobject > TreePath)) -> (() > void > ()),
+    "row-expanded", connect_row_expanded
+        (_, iter: (*mut GtkTreeIter > translate_treeiter > &mut TreeIter),
+            path: (*mut GtkTreePath > gobject > TreePath)) -> (() > void > ()),
+    "select-all", connect_select_all(_) -> (bool > to_glib > gboolean),
+    "select-cursor-parent", connect_select_cursor_parent(_) -> (bool > to_glib > gboolean),
+    "select-cursor-row", connect_select_cursor_row
+        (_, arg1: (gboolean > from_glib > bool)) -> (bool > to_glib > gboolean),
+    "start-interactive-search", connect_start_interactive_search(_) -> (bool > to_glib > gboolean),
+    "test-collapse-row", connect_test_collapse_row
+        (_, iter: (*mut GtkTreeIter > translate_treeiter > &mut TreeIter),
+            path: (*mut GtkTreePath > gobject > TreePath)) -> (bool > to_glib > gboolean),
+    "test-expand-row", connect_test_expand_row
+        (_, iter: (*mut GtkTreeIter > translate_treeiter > &mut TreeIter),
+            path: (*mut GtkTreePath > gobject > TreePath)) -> (bool > to_glib > gboolean),
+    "toggle-cursor-row", connect_toggle_cursor_row(_) -> (bool > to_glib > gboolean),
+    "unselect-all", connect_unselect_all(_) -> (bool > to_glib > gboolean)
+);
 
-        fn connect_response<F: Fn(Dialog, i32) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(Dialog, i32) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "response",
-                    transmute(int_trampoline), into_raw(f) as *mut _)
-            }
-        }
-    }
 
-    extern "C" fn void_trampoline(this: *mut GtkDialog, f: &Box<Fn(Dialog) + 'static>) {
-        f(FFIWidget::wrap_widget(this as *mut _));
-    }
-
-    extern "C" fn int_trampoline(this: *mut GtkDialog, response: c_int,
-            f: &Box<Fn(Dialog, i32) + 'static>) {
-        f(FFIWidget::wrap_widget(this as *mut _), response);
-    }
-}
-
-pub trait TreeViewSignals {
-    fn connect_columns_changed<F: Fn(TreeView) + 'static>(&self, f: F) -> u64;
-    fn connect_cursor_changed<F: Fn(TreeView) + 'static>(&self, f: F) -> u64;
-    fn connect_expand_collapse_cursor_row<F: Fn(TreeView, bool, bool, bool) -> bool + 'static>(&self, f: F)
-        -> u64;
-    fn connect_row_activated<F: Fn(TreeView, TreePath, TreeViewColumn) + 'static>(&self, f: F) -> u64;
-    fn connect_row_collapsed<F: Fn(TreeView, &mut TreeIter, TreePath) + 'static>(&self, f: F) -> u64;
-    fn connect_row_expanded<F: Fn(TreeView, &mut TreeIter, TreePath) + 'static>(&self, f: F) -> u64;
-    fn connect_select_all<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64;
-    fn connect_select_cursor_parent<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64;
-    fn connect_select_cursor_row<F: Fn(TreeView, bool) -> bool + 'static>(&self, f: F) -> u64;
-    fn connect_start_interactive_search<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64;
-    fn connect_test_collapse_row<F: Fn(TreeView, &mut TreeIter, TreePath) -> bool + 'static>(&self, f: F)
-        -> u64;
-    fn connect_test_expand_row<F: Fn(TreeView, &mut TreeIter, TreePath) -> bool + 'static>(&self, f: F)
-        -> u64;
-    fn connect_toggle_cursor_row<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64;
-    fn connect_unselect_all<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64;
-}
-
-mod tree_view {
-    use super::into_raw;
-    use std::mem::transmute;
-    use glib::signal::connect;
-    use glib::translate::*;
-    use traits::FFIWidget;
-    use glib_ffi::gboolean;
-    use ffi::{GtkTreeIter, GtkTreePath, GtkTreeView, GtkTreeViewColumn};
-    use {TreeIter, TreePath, TreeView, TreeViewColumn};
-
-    impl super::TreeViewSignals for TreeView {
-        fn connect_columns_changed<F: Fn(TreeView) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "columns-changed",
-                    transmute(void_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_cursor_changed<F: Fn(TreeView) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "cursor-changed",
-                    transmute(void_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_expand_collapse_cursor_row<F: Fn(TreeView, bool, bool, bool) -> bool + 'static>(&self,
-                f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView, bool, bool, bool) -> bool + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "expand-collapse-cursor-row",
-                    transmute(bool3_bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_row_activated<F: Fn(TreeView, TreePath, TreeViewColumn) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView, TreePath, TreeViewColumn) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "row-activated",
-                    transmute(path_column_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_row_collapsed<F: Fn(TreeView, &mut TreeIter, TreePath) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView, &mut TreeIter, TreePath) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "row-collapsed",
-                    transmute(iter_path_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_row_expanded<F: Fn(TreeView, &mut TreeIter, TreePath) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView, &mut TreeIter, TreePath) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "row-expanded",
-                    transmute(iter_path_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_select_all<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView) -> bool + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "select-all",
-                    transmute(bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_select_cursor_parent<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView) -> bool + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "select-cursor-parent",
-                    transmute(bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_select_cursor_row<F: Fn(TreeView, bool) -> bool + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView, bool) -> bool + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "select-cursor-row",
-                    transmute(bool_bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_start_interactive_search<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView) -> bool + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "start-interactive-search",
-                    transmute(bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_test_collapse_row<F: Fn(TreeView, &mut TreeIter, TreePath) -> bool + 'static>(&self, f: F)
-                -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView, &mut TreeIter, TreePath) -> bool + 'static>> =
-                    Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "test-collapse-row",
-                    transmute(iter_path_bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_test_expand_row<F: Fn(TreeView, &mut TreeIter, TreePath) -> bool + 'static>(&self, f: F)
-                -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView, &mut TreeIter, TreePath) -> bool + 'static>> =
-                    Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "test-expand-row",
-                    transmute(iter_path_bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_toggle_cursor_row<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView) -> bool + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "toggle-cursor-row",
-                    transmute(bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_unselect_all<F: Fn(TreeView) -> bool + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(TreeView) -> bool + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "unselect-all",
-                    transmute(bool_trampoline), into_raw(f) as *mut _)
-            }
-        }
-    }
-
-    extern "C" fn void_trampoline(this: *mut GtkTreeView, f: &Box<Fn(TreeView) + 'static>) {
-        f(FFIWidget::wrap_widget(this as *mut _));
-    }
-
-    extern "C" fn bool_trampoline(this: *mut GtkTreeView, f: &Box<Fn(TreeView) -> bool + 'static>)
-            -> gboolean {
-        f(FFIWidget::wrap_widget(this as *mut _)).to_glib()
-    }
-
-    extern "C" fn bool_bool_trampoline(this: *mut GtkTreeView, arg1: gboolean,
-            f: &Box<Fn(TreeView, bool) -> bool + 'static>) -> gboolean {
-        f(FFIWidget::wrap_widget(this as *mut _), from_glib(arg1)).to_glib()
-    }
-
-    extern "C" fn bool3_bool_trampoline(this: *mut GtkTreeView, arg1: gboolean, arg2: gboolean,
-            arg3: gboolean, f: &Box<Fn(TreeView, bool, bool, bool) -> bool + 'static>) -> gboolean {
-        f(FFIWidget::wrap_widget(this as *mut _), from_glib(arg1), from_glib(arg2),
-            from_glib(arg3)).to_glib()
-    }
-
-    extern "C" fn path_column_trampoline(this: *mut GtkTreeView, path: *mut GtkTreePath,
-            column: *mut GtkTreeViewColumn, f: &Box<Fn(TreeView, TreePath, TreeViewColumn) + 'static>) {
-        f(FFIWidget::wrap_widget(this as *mut _), TreePath::wrap_pointer(path),
-            TreeViewColumn::wrap_pointer(column));
-    }
-
-    extern "C" fn iter_path_trampoline(this: *mut GtkTreeView, iter: *mut GtkTreeIter,
-            path: *mut GtkTreePath, f: &Box<Fn(TreeView, &mut TreeIter, TreePath) + 'static>) {
-        f(FFIWidget::wrap_widget(this as *mut _), &mut TreeIter::wrap_pointer(iter),
-            TreePath::wrap_pointer(path));
-    }
-
-    extern "C" fn iter_path_bool_trampoline(this: *mut GtkTreeView, iter: *mut GtkTreeIter,
-            path: *mut GtkTreePath, f: &Box<Fn(TreeView, &mut TreeIter, TreePath) -> bool + 'static>)
-            -> gboolean {
-        f(FFIWidget::wrap_widget(this as *mut _), &mut TreeIter::wrap_pointer(iter),
-            TreePath::wrap_pointer(path)).to_glib()
-    }
-}
-
-pub trait RangeSignals {
-    fn connect_adjust_bounds<F: Fn(Range, f64) + 'static>(&self, f: F) -> u64;
-    fn connect_change_value<F: Fn(Range, ScrollType, f64) -> Inhibit + 'static>(&self, f: F) -> u64;
-    fn connect_move_slider<F: Fn(Range, ScrollType) + 'static>(&self, f: F) -> u64;
-    fn connect_value_changed<F: Fn(Range) + 'static>(&self, f: F) -> u64;
-}
-
-mod range {
-    use super::into_raw;
-    use std::mem::transmute;
-    use libc::c_double;
-    use glib::signal::connect;
-    use glib::translate::*;
-    use traits::{FFIWidget, RangeTrait};
-    use glib_ffi::gboolean;
-    use ffi::{GtkRange};
-    use {Range, ScrollType};
-    use super::Inhibit;
-
-    impl<T: FFIWidget + RangeTrait> super::RangeSignals for T {
-        fn connect_adjust_bounds<F: Fn(Range, f64) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(Range, f64) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "adjust-bounds",
-                    transmute(adjust_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_change_value<F: Fn(Range, ScrollType, f64) -> Inhibit + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(Range, ScrollType, f64) -> Inhibit + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "change-value",
-                    transmute(change_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_move_slider<F: Fn(Range, ScrollType) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(Range, ScrollType) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "move-slider",
-                    transmute(move_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-        fn connect_value_changed<F: Fn(Range) + 'static>(&self, f: F) -> u64 {
-            unsafe {
-                let f: Box<Box<Fn(Range) + 'static>> = Box::new(Box::new(f));
-                connect(self.unwrap_widget() as *mut _, "value-changed",
-                    transmute(void_trampoline), into_raw(f) as *mut _)
-            }
-        }
-
-    }
-
-    extern "C" fn void_trampoline(this: *mut GtkRange, f: &Box<Fn(Range) + 'static>) {
-        f(FFIWidget::wrap_widget(this as *mut _));
-    }
-
-    extern "C" fn adjust_trampoline(this: *mut GtkRange, value: c_double,
-            f: &Box<Fn(Range, f64) + 'static>) {
-        f(FFIWidget::wrap_widget(this as *mut _), value);
-    }
-
-    extern "C" fn change_trampoline(this: *mut GtkRange, scroll: ScrollType, value: c_double,
-            f: &Box<Fn(Range, ScrollType, f64) -> Inhibit + 'static>) -> gboolean {
-        f(FFIWidget::wrap_widget(this as *mut _), scroll, value).to_glib()
-    }
-
-    extern "C" fn move_trampoline(this: *mut GtkRange, step: ScrollType,
-            f: &Box<Fn(Range, ScrollType) + 'static>) {
-        f(FFIWidget::wrap_widget(this as *mut _), step);
-    }
-}
-
-impl Adjustment {
-    pub fn connect_value_changed<F: Fn(Adjustment) + 'static>(&self, f: F) -> u64 {
-        unsafe {
-            let f: Box<Box<Fn(Adjustment) + 'static>> = Box::new(Box::new(f));
-            connect(self.unwrap_pointer() as *mut _, "value-changed",
-                transmute(adjustment_trampoline), into_raw(f) as *mut _)
-        }
-    }
-}
-
-extern "C" fn adjustment_trampoline(this: *mut GtkAdjustment, f: &Box<Fn(Adjustment) + 'static>) {
-    f(Adjustment::wrap_pointer(this))
-}
+signal_trait!(RangeSignals, Range,
+    connect_adjust_bounds(_, f64),
+    connect_change_value(_, ScrollType, f64) -> Inhibit,
+    connect_move_slider(_, ScrollType),
+    connect_value_changed(_)
+);
+signal_impl!(widget, RangeSignals, Range, ::ffi::GtkRange,
+    "adjust-bounds", connect_adjust_bounds(_, value: (f64 > echo > f64)) -> (() > void > ()),
+    "change-value", connect_change_value(_, scroll: (ScrollType > echo > ScrollType),
+                                             value: (f64 > echo > f64)) -> (Inhibit > to_glib > gboolean),
+    "move-slider", connect_move_slider(_, scroll: (ScrollType > echo > ScrollType)) -> (() > void > ()),
+    "value-changed", connect_value_changed(_) -> (() > void > ())
+);
 
 impl TreeSelection {
     pub fn connect_changed<F: Fn(TreeSelection) + 'static>(&self, f: F) -> u64 {
@@ -1327,17 +1157,26 @@ extern "C" fn tree_selection_trampoline(this: *mut GtkTreeSelection,
     f(TreeSelection::wrap_object(this as *mut _))
 }
 
-impl TreeViewColumn {
-    pub fn connect_clicked<F: Fn(TreeViewColumn) + 'static>(&self, f: F) -> u64 {
-        unsafe {
-            let f: Box<Box<Fn(TreeViewColumn) + 'static>> = Box::new(Box::new(f));
-            connect(self.unwrap_pointer() as *mut _, "clicked",
-                transmute(tree_view_column_trampoline), into_raw(f) as *mut _)
-        }
-    }
-}
+signal_trait!(AdjustmentSignals, Adjustment,
+    connect_value_changed(_)
+);
+signal_impl!(
+    gobject, AdjustmentSignals, Adjustment, GtkAdjustment,
+    "value-changed", connect_value_changed(_) -> (() > void > ())
+);
 
-extern "C" fn tree_view_column_trampoline(this: *mut GtkTreeViewColumn,
-        f: &Box<Fn(TreeViewColumn) + 'static>) {
-    f(TreeViewColumn::wrap_pointer(this))
-}
+
+signal_trait!(TreeViewColumnSignals, TreeViewColumn,
+    connect_clicked(_)
+);
+signal_impl!(gobject, TreeViewColumnSignals, TreeViewColumn, GtkTreeViewColumn,
+    "clicked", connect_clicked(_) -> (() > void > ())
+);
+
+
+signal_trait!(ExpanderSignals, ::Expander,
+    connect_activate(_)
+);
+signal_impl!(widget, ExpanderSignals, ::Expander, ::ffi::GtkExpander,
+    "activate", connect_activate(_) -> (() > void > ())
+);
